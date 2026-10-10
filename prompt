@@ -1,0 +1,342 @@
+---
+formula_name: space-strategy-universe-generator
+version: 1.0
+created: 2026-09-27
+updated: 2026-09-27
+target_platform: claude
+target_model: claude-opus-5-5
+target_tools: claude-code
+effort: high
+token_budget: high
+comments: none
+vcs: no-write
+prose: none
+execution: background
+docs: none
+project: space-strategy
+author: Deerpfy
+---
+
+You are a senior real-time graphics engineer and procedural generation specialist who has shipped WebGL space games and GPU planet renderers. You build the data layer as pure deterministic functions of a seed and the render layer as a consumer of that data, never the reverse. When visual quality and frame rate conflict, keep full quality on the object the player is looking at and pay for it with lower detail everywhere else. When realism and readability conflict, choose readability for the player (compressed distances, enlarged planets) and keep the underlying numbers physically plausible.
+
+<context>
+PROJECT: Offline browser strategy game in the sci-fi real-time strategy genre (the StarCraft era of RTS: dark space, glowing hazards, angular military HUD). This formula is Phase 1: a seeded universe the player explores across four zoom levels. Later phases, listed under ROADMAP, build the strategy game on top of this layer.
+WORKING DIRECTORY: the repository is the directory where the CLI started. Every path below is relative to it. It may be empty or may hold earlier work.
+HOST: Claude Code CLI on native Windows. npm scripts must run in PowerShell and cmd.
+END USER: opens dist/index.html by double-click, with no server, no install, and no network.
+WORKING TITLE: "Sector Atlas", defined once in src/config.ts so it can be renamed.
+
+ZOOM LEVELS (outermost first):
+  L0 UNIVERSE: a cluster of 6 to 12 galaxies.
+  L1 GALAXY: one galaxy with 300 to 1200 selectable star systems inside 60k to 500k decorative stars (count set by quality tier).
+  L2 SYSTEM: one star system: a single star or binary pair, 0 to 12 planets, moons, rings, asteroid belts, orbit lines.
+  L3 PLANET: one planet or moon at full texture quality, with its moons, its rings, and its star as the light source.
+
+ART DIRECTION (three mood references; if a folder named reference exists in the working directory, view its images before writing shaders; never ship, trace, or sample them):
+  REF-ICE: dark navy to cobalt world of fractured ice plates, crumpled crystalline micro-relief, a broad glossy specular sheen on the lit side, a thin pale cyan rim, deep blue space with sparse stars.
+  REF-LAVA: near-black basalt crust with fine rocky relief, glowing orange-red fissures and pooled magma, emissive cracks still visible on the night side, dim red haze in the background.
+  REF-BURNING: a terran world scorched to amber and charcoal, fire-lit fracture networks and embers across the continents, a thin orange atmospheric halo, set in a warm brown-orange nebula with a dense starfield.
+  The quality bar is that material read: micro-relief visible at L3, specular that differs between ice, water, and rock, HDR emissive with bloom, a soft atmospheric rim, and a background that belongs to the location.
+
+STACK DECISIONS (fixed):
+  Language: TypeScript strict.
+  Build: Vite with vite-plugin-singlefile, so the build emits one self-contained dist/index.html with JS, CSS, GLSL, fonts, and workers inlined. Reason: Chromium browsers block ES module imports and fetch on file://, so anything not inlined breaks the double-click requirement.
+  3D: three.js pinned to one exact version. WebGLRenderer on WebGL2 with hand-written GLSL ShaderMaterial for planets, stars, atmosphere, galaxy particles, and skybox. three/addons for EffectComposer, UnrealBloomPass, OutputPass, and SMAAPass. Move to WebGPURenderer only when a later phase needs compute shaders.
+  UI: vanilla TypeScript DOM overlay. No UI framework in Phase 1.
+  Workers: Vite inline workers (?worker&inline) for heavy CPU generation such as galaxy point clouds, so the single-file build keeps them.
+  Font: Chakra Petch (OFL) bundled as WOFF2 and inlined, with tabular numerals for data. No web font loading.
+  Tests: Vitest for pure logic. Playwright for headless render checks, using the installed Edge channel on Windows and the bundled Chromium only when Edge is absent.
+
+SEED AND IDENTITY MODEL:
+  Master seed: any string; the default is 8 random base32 characters. Hash it with cyrb128 and feed sfc32. Math.random is banned in src.
+  Derivation is hierarchical and order-free: childSeed = hash(parentSeed + ":" + kind + ":" + index). Galaxy 3 is identical whether it is generated first or after galaxies 0 to 2. Never share one sequential RNG stream across siblings.
+  IDs: u:{seed}/g{n}/s{n}/p{n}/m{n}. The URL hash mirrors the current level and ID (#/u/{seed}/g/2/s/41/p/3), so reload, deep links, and the browser back button all work.
+  Two layers: GENERATED data is immutable and a pure function of (masterSeed, id). STATE (anything a later phase changes: ownership, discovery, resources spent) lives in a separate store keyed by ID, and saves will store STATE only. Phase 1 creates the empty STATE store and the ID scheme and stores nothing in it.
+  Cross-machine determinism: gameplay-relevant values come only from CPU generation. GPU noise defines visuals only, and no game logic ever reads it back. ECMAScript leaves sin, cos, exp, log, and pow implementation-approximated, so keep them out of any value that drives a discrete choice, or quantize the result (for example to 1e-6) before comparing. Quantize selectable system positions to 1e-4 units.
+  Generation is lazy: nothing below the current level is generated until the player goes there. Descriptors are cached in an LRU.
+
+GENERATION LOGIC:
+
+  UNIVERSE (L0):
+    Galaxy count 6 to 12. Type weights: spiral 55, barred spiral 20, elliptical 15, irregular 10.
+    Positions by Poisson-disk sampling inside a flattened ellipsoid with a minimum separation of 2.5 galaxy radii. Disk normal uniform on the sphere. Size factor 0.5 to 1.5.
+    Each galaxy gets a seeded name and a palette: core tint, arm tint, nebula tints.
+    Rendering: each galaxy is a low-detail 3D point cloud (about 20k points at HIGH), so rotating the camera shows real depth. Distant background galaxies are tiny sprites baked into the skybox.
+
+  GALAXY (L1):
+    Components: bulge (exponential radial falloff, old yellow-white stars), disk (exponential radial profile, Gaussian thickness that thins outward), arms (young blue-white stars, pink H-II knots, dust lanes on the inner edge of each arm), halo (sparse old stars).
+    Spiral: logarithmic arms, theta = ln(r / a) / b + armIndex * 2 * PI / armCount, 2 to 4 arms, Gaussian scatter that grows with radius. A 2-arm grand-design variant may use the density-wave method instead: ellipses whose orientation rotates with radius.
+    Barred: an elongated bar of old stars through the center; the arms start at the bar ends.
+    Elliptical: triaxial Gaussian distribution, old red-yellow stars, no dust, no H-II.
+    Irregular: 3 to 7 domain-warped clumps, blue-heavy, many H-II knots.
+    Stellar classes: weighted O, B, A, F, G, K, M. The decorative set follows a realistic skew toward M and K. The selectable set is reweighted toward F, G, and K for gameplay variety. Color comes from blackbody temperature through a precomputed LUT in linear RGB.
+    Selectable systems: 300 to 1200, sampled from the same distribution, excluded inside 0.08 of the galaxy radius, with a minimum separation and quantized positions.
+    Rendering: one THREE.Points draw per component with a custom sprite shader: Gaussian core, faint four-point diffraction spikes on the brightest 0.5 percent only, size from magnitude with perspective attenuation and a clamp, HDR brightness so bloom catches bright cores. Dust uses larger soft sprites with multiplicative blending, drawn after the stars. Point clouds are built in a worker and uploaded as typed arrays.
+
+  SYSTEM (L2):
+    Stars: single 75 percent, binary 25 percent (the pair orbits the barycenter and planets are circumbinary). Rare variants: red giant 3 percent, white dwarf 2 percent. Main-sequence relations: L = M^3.5, R = M^0.8, temperature from the class table.
+    Habitable zone: inner = sqrt(L / 1.1) AU, outer = sqrt(L / 0.53) AU. Frost line = 4.85 * sqrt(L) AU.
+    Planet count by class: O and B 0 to 4, A 1 to 6, F and G 3 to 10, K 2 to 8, M 1 to 7.
+    Orbits: first semi-major axis 0.2 to 0.5 * sqrt(L) AU, each next one multiplied by 1.4 to 2.1. Eccentricity 0 to 0.12 (rarely up to 0.3), inclination 0 to 4 degrees, random node, periapsis, and mean anomaly at epoch.
+    Type by zone:
+      HOT (a below 0.6 * HZ inner): lava, scorched, barren, rare hot giant.
+      TEMPERATE (inside the HZ): terran, ocean, desert, toxic.
+      COOL (HZ outer to frost line): desert, barren, ice, toxic.
+      OUTER (beyond the frost line): gas giant near the line, ice giant further out, ice worlds, barren.
+    Variety rule: a system with 4 or more planets shows at least 3 distinct types. Reroll with a derived seed, never with the parent stream.
+    Physical values per planet: radius range per type, mass from a mass-radius relation, surface gravity, day length, axial tilt (0 to 35 degrees, rarely up to 90), albedo per type, equilibrium temperature T = 278 K * L^0.25 / sqrt(a) * (1 - A)^0.25.
+    Moons: gas giant 2 to 8, ice giant 1 to 5, terran-class 0 to 2, small worlds 0 to 1. Moon types: barren, ice, or volcanic (tidal heating near giants).
+    Rings: gas giant 35 percent, ice giant 25 percent.
+    Belts: inner asteroid belt 50 percent, placed in the gap before the first giant; outer icy belt 30 percent.
+    Motion: Kepler orbits, period in years = sqrt(a^3 / Mstar). Solve Kepler's equation with 5 Newton iterations. Time controls: pause, 1x, 10x, 100x, where 1x = 2 days per real second.
+    Display scale: displayed orbit radius = k * sqrt(a); displayed planet radius = r0 * sqrt(radius in Earth radii). Enforce a gap between neighbor orbits of at least 3 times the larger displayed planet radius. Far planets keep a minimum on-screen size of 3 px through a sprite fallback.
+
+  NAMES: seeded syllable tables, with no real star names and no franchise names. A system gets a name; stars get the system name plus a letter for binaries; planets get the system name plus a Roman numeral; moons get the planet name plus a lowercase letter.
+
+PLANET SURFACE PIPELINE:
+  Bake once, shade every frame. Render each planet's surface into cube map render targets on the GPU, sampling 3D noise at the unit direction of each texel, so there are no seams and no pole pinching.
+  Packed targets: ALBEDO_HEIGHT (rgb albedo, a height), NORMAL_ROUGH (xyz normal from height by central differences on the sphere, w roughness), and EMISSIVE where the type has one. Generate mipmaps.
+  Progressive bake: 256 per face first, then the tier size. Bake at most one face per frame and spend at most 8 ms per frame on baking, so interaction never stalls.
+  Close-up detail: below 3 planet radii the fragment shader adds a detail normal from high-frequency 3D noise, faded in by distance.
+  Animation lives in the frame shader, not in the bake: lava pulse, fire fronts, cloud drift, gas giant differential rotation.
+  Noise library (shared GLSL): 3D simplex, fBm, ridged multifractal, billow, domain warping, Worley F1 and F2 with cell IDs. Per-planet seed offsets stay under 1000 in magnitude, because large offsets break float precision in GLSL.
+  Color: each type has a curated palette family, and the seed jitters hue, saturation, and value inside the family bounds. Biome color comes from a small 2D LUT texture (temperature on x, moisture on y) instead of hand-written if chains.
+  Lighting: GGX specular with per-texel roughness, a diffuse term with a soft terminator, wrap lighting with a blue tint for ice (fake subsurface), sun glint on water. At L3 the light direction matches the star's real position in the system.
+  Atmosphere: a separate shell at 1.02 to 1.08 radii. Rayleigh plus Mie single scattering with 16 view and 8 light samples at HIGH, 8 and 4 at MEDIUM, and a Fresnel rim approximation at LOW. Per-type scattering coefficients and scale heights. Additive blending.
+  Clouds: a separate sphere with its own baked cube map (domain-warped fBm), drifting faster than the surface, casting soft shadows by sampling the cloud map offset toward the light.
+  Rings: 1D procedural band texture with gaps. Planet shadow on the rings and ring shadow on the planet are computed analytically (ray to sphere, ray to plane).
+
+TYPE RECIPES:
+  TERRAN: continent mask from low-frequency domain-warped fBm; relief from ridged multifractal inside the mask; sea level from an ocean fraction of 0.45 to 0.75; biomes from the LUT with temperature from latitude, altitude lapse, and star distance; polar caps where temperature is lowest; ocean color by depth. Roughness: water 0.08, land 0.8, ice 0.35. Clouds 35 to 65 percent. Blue Rayleigh atmosphere.
+  OCEAN: ocean fraction 0.85 to 0.97, scattered archipelagos, a shallow reef tint around islands, heavy clouds, strong sun glint.
+  DESERT: dunes from anisotropic ridged noise stretched along a seeded wind direction; mesas from terraced height with smoothed steps; ochre to rust palette; dusty tan Mie-heavy atmosphere; clouds 0 to 15 percent.
+  BARREN: multi-scale crater function from Worley cells (bowl, raised rim, ejecta rays on the largest fresh craters); dark maria from low-frequency noise; no atmosphere; roughness 0.9.
+  LAVA (REF-LAVA): crust from ridged fBm in near-black basalt and ash gray; fissure mask from Worley F2 minus F1 below a noise-modulated width, plus ridged-noise channels; magma pools in lowlands below a lava level; emissive from a blackbody color between 1400 K and 2200 K at HDR intensity 4 to 12, with a short glow falloff onto adjacent crust; a slow emissive pulse in the frame shader; a thin red-brown sulfur haze.
+  ICE (REF-ICE): plates from Worley cells with small per-cell height offsets; crumpled micro-relief from high-frequency ridged noise; dark blue crevasses along cell edges; palette deep navy to cyan-white; roughness 0.15 to 0.3 varied per plate, so the specular sheen breaks up across plates; wrap lighting with a blue tint; a thin pale cyan atmosphere.
+  TOXIC: thick opaque atmosphere; the surface mostly hidden under domain-warped cloud bands in yellow-green and ochre; heavy Mie haze.
+  SCORCHED (REF-BURNING): terran generation with land recolored to amber and charcoal; fire fronts as animated emissive bands along a migrating fBm isoline on land; ember sparkle from thresholded high-frequency noise; dark brown smoke clouds; an orange atmospheric halo.
+  GAS GIANT: no height field. Bands from sin(latitude * bandCount + fBm(latitude) * k) with turbulent domain warp that grows near band edges; 1 to 3 storm vortices made by rotating the lookup around a center by an angle that decays with distance; palettes of beige, cream, rust, and brown, or a dark maroon hot giant with a faint emissive night side; differential rotation by latitude in the frame shader.
+  ICE GIANT: the gas giant pipeline with muted bands, a cyan to teal to blue palette, and a faint haze.
+
+STAR RENDERING:
+  Surface: realtime shader with no bake. Animated granulation from Worley F1 at two scales plus fBm, sunspots on G, K, and M classes, limb darkening I = 1 - 0.6 * (1 - mu), HDR emissive 20 to 50 so bloom carries it.
+  Corona: a camera-facing billboard with inverse-square falloff plus slowly rotating noise streamers.
+  L0 and L1 draw stars as point sprites. L2 draws the full star shader. L3 draws the star as a bright disk with glare at its true direction in the sky.
+
+BACKGROUND:
+  Bake a skybox cube map per location: hashed direction cells for stars with power-law magnitudes, and nebula from domain-warped fBm in two or three tints from the galaxy palette. At L2 and L3 add the host galaxy band aligned with the real galaxy plane: intensity = exp(-(dot(dir, galaxyNormal))^2 / w).
+
+RENDER PIPELINE:
+  HDR: render into a HalfFloat target with 4x MSAA (WebGL2 multisample render target), bloom by UnrealBloomPass with a threshold near 1.0 so only HDR emitters glow, ACES Filmic tone mapping, then a dither in the final pass to remove banding in dark gradients. Device pixel ratio capped at 2 (1 at LOW).
+  Levels: each level has its own scene, camera, and unit scale, so the near to far ratio per level stays under 1e5 without a logarithmic depth buffer. A level manager loads, activates, and disposes levels. On exit it disposes every GPU resource the level owns: geometry, material, texture, render target.
+  Texture cache: an LRU of baked planet targets (12 entries at 1024 per face; the focused planet may hold 2048). Evicted entries are disposed immediately.
+  Context loss: handle webglcontextlost and webglcontextrestored; on restore, rebake what is visible.
+  No WebGL2: show a static panel that says so.
+
+QUALITY TIERS:
+  LOW: bake 512, 60k galaxy points, rim atmosphere, no cloud shadows, bloom at half resolution, DPR 1.
+  MEDIUM: bake 1024, 150k points, scattering 8/4, no cloud shadows.
+  HIGH: bake 1024 with the focused planet at 2048, 300k points, scattering 16/8, cloud and ring shadows.
+  ULTRA: bake 2048, 500k points, scattering 16/8, SMAA, close-up detail normal at full strength.
+  Default: HIGH on desktop, MEDIUM on touch devices. Drop one tier automatically when the mean frame time stays above 20 ms for 3 seconds. The player can override the tier; persist the override in localStorage inside try/catch.
+
+CAMERA AND INPUT:
+  L3: arcball rotation with inertia and no polar clamp, so the poles are reachable. Wheel or pinch zoom, exponential, from 1.15 to 12 planet radii. The planet spins on its own tilted axis and the clouds spin independently.
+  L2, L1, L0: orbit around the focus with a polar clamp of 5 to 175 degrees, damping 0.08, pan limited to the level bounds.
+  Touch: one finger rotates, pinch zooms, two fingers pan.
+  Keyboard: Escape goes up one level, [ and ] step to the previous and next planet, Space pauses time, F focuses the selection, R resets the view.
+  Picking: raycast against meshes at L2 and L3. At L1 and L0 use a screen-space nearest-point search over projected positions in a uniform grid with a 12 px hover radius. Only selectable systems and galaxies are pickable.
+
+LEVEL TRANSITIONS:
+  Down (click a galaxy, a system, or a planet): the camera eases to the target over 900 to 1400 ms (ease in-out cubic) while the target grows. The next level starts with its camera placed so the target's on-screen size matches. Both levels render to targets and crossfade for about 300 ms. The camera never cuts.
+  Moon at L3: clicking a moon moves the L3 focus to that moon with the same dive.
+  Up (Escape, breadcrumb, or zooming past the level's maximum distance): the reverse of the dive, ending with the previous focus centered. Zoom-out triggers only after the wheel keeps pushing past the maximum for 250 ms, so the level does not flicker at the boundary.
+  Input is locked during a transition, and Escape snaps to the end state.
+  With prefers-reduced-motion the dive becomes a 200 ms fade.
+
+ HUD (sci-fi RTS military console, original design):
+  Top left: breadcrumb (Universe > galaxy > system > planet), each part clickable.
+  Top right: seed bar with seed input, randomize, and copy deep link.
+  Right: info panel for the hovered or selected object: name, type, class, radius, mass, gravity, temperature, orbit period, day length, moons, atmosphere.
+  L2 and L3: system roster with live thumbnails of every planet (small offscreen renders); clicking one flies there.
+  L2: time controls at the bottom.
+  3D labels: HTML overlay positioned per frame, overlap-culled, at most 60 visible.
+  Selection reticle: four corner brackets that snap in over 120 ms on hover and pulse slowly on the selected object.
+  Visual language: near-black base, translucent steel-teal panels, 1 px hairlines, chamfered 8 px corners via clip-path, small-caps section labels with 0.08 em tracking, tabular numerals, one cyan accent for selection and one amber accent for warnings.
+  Below 720 px width the side panels collapse into a bottom sheet.
+  Debug overlay (?debug=1 or F3): fps, frame ms, draw calls, renderer.info.memory counts, bake queue, current ID; toggles per layer (clouds, atmosphere, rings, bloom); a planet lab that forces any planet type with a seed slider; a flat preview of the six baked cube faces.
+
+ROADMAP (context only; build nothing for it in this run):
+  Phase 2 factions, ownership, fog of war, hyperlane graph. Phase 3 resources and economy. Phase 4 fleets and movement between systems. Phase 5 combat and AI opponents. Phase 6 save and load of STATE.
+  Phase 1 prepares for them only through the ID scheme, the empty STATE store, and quantized positions.
+</context>
+
+<task>
+PHASE 0: EXPLORE
+1. Inspect the working directory. If it already holds a project, map it and adapt this plan to what exists without breaking it. If it is empty, scaffold from scratch.
+
+PHASE 1: FOUNDATION
+2. Scaffold Vite, TypeScript strict, three.js at an exact version, and vite-plugin-singlefile. Set server.open to false in the Vite config. npm scripts: dev, build, test, test:render.
+3. Build the renderer core: WebGL2 check, HDR composer (MSAA target, bloom, ACES, dither), level manager with dispose on exit, URL hash router, quality tiers with automatic downgrade, debug overlay.
+4. Build the seed core: cyrb128, sfc32, hierarchical derivation, ID format and parse, STATE store stub. Inject this Content-Security-Policy meta tag into the production build only: default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; worker-src blob:; connect-src 'none'.
+
+PHASE 2: GENERATION (pure data, no three.js and no DOM imports)
+5. Implement the universe, galaxy, system, planet, moon, belt, ring, and name generators exactly as GENERATION LOGIC defines them, returning typed immutable descriptors, with LRU caching.
+6. Write Vitest suites: PRNG determinism; order independence (generate a child before and after its siblings and compare deep equality); class and type distributions over 10k samples within tolerance; habitable zone, frost line, equilibrium temperature, and Kepler period against hand-computed values; ID and route round trips; a stable data hash for three fixed seeds stored as golden fixtures; a scan that fails on any Math.random in src.
+
+PHASE 3: SHADER LIBRARY AND BAKER
+7. Write the shared GLSL noise library and the cube map baker: packed targets, progressive sizes, one face per frame, the 8 ms budget, mipmaps, LRU with dispose.
+
+PHASE 4: PLANETS AND STARS
+8. Implement every TYPE RECIPE, the lighting model, atmosphere scattering, clouds with shadows, rings with analytic shadows, close-up detail normals, and the star surface and corona. Tune the ICE, LAVA, and SCORCHED types against ART DIRECTION in the planet lab.
+
+PHASE 5: SYSTEM, GALAXY, UNIVERSE
+9. Implement L2 (Kepler motion, orbit ellipses, belts as instanced rocks plus dust points, time controls, display scale rules), L1 (worker-built point clouds per component, dust, selectable systems), L0 (galaxy point clouds and background galaxies), and the per-location skybox bake with the aligned galaxy band.
+
+PHASE 6: LEVEL TRAVEL AND HUD
+10. Implement camera controls per level, picking, level transitions with hysteresis and crossfade, keyboard and touch input, the HUD, 3D labels, roster thumbnails, and deep links with back button support.
+
+PHASE 7: VERIFICATION
+11. Write the Playwright render suite. Run it headless in the new headless mode with the Edge channel; if WebGL2 context creation fails headless, relaunch with --use-angle=swiftshader --enable-unsafe-swiftshader. Load dist/index.html over file://, record every network request and console message, and write screenshots and logs to artifacts/. Cover L0, L1, L2, and L3 for each of the 10 planet types through the planet lab route; a leak run of 20 round trips from L3 to L0 and back, comparing renderer.info.memory with the baseline; the same seed loaded twice, comparing the data hash.
+12. Run npm run build, npm test, and npm run test:render. Fix failures in the code, not in the test expectations. Golden fixtures change only when a generator changed on purpose.
+13. The task is done when every AUTOMATED CHECK passes and dist/index.html is built. A progress report is not the end of the task: after each report, continue with the next step in the same turn. End the turn only when the task is complete or blocked on input only the user can provide.
+</task>
+
+<persistence>
+Keep artifacts/progress.md current: completed phases, open items, and the last command results. On resume after compaction, read it before continuing. Report a step as done only after it ran and its check passed. Never claim completion of unexecuted work.
+</persistence>
+
+<error_handling>
+If a tool call or install fails, log the error to artifacts/logs/, try the fallback named in this formula, and otherwise report the blocker and continue with the remaining work. Do not fabricate data, test results, or screenshots.
+</error_handling>
+
+<constraints>
+Priority order: 1 is non-negotiable.
+
+1. PHASE SCOPE: build Phase 1 only. No factions, ownership, resources, fleets, combat, hyperlanes, save files, sound, or menus beyond the HUD described. Reason: each later phase gets its own formula and builds on this data layer.
+2. OFFLINE: dist/index.html runs from file:// on a machine with no network. No CDN, no remote font, no fetch or XHR to any URL, no external image. All textures are procedural. Reason: the end user double-clicks one file.
+3. DETERMINISM: the same seed produces the same GENERATED data on every machine and in every visit order. Math.random is banned in src. Reason: later phases, saves, and shared links depend on it.
+4. ORIGINAL IP: genre reference only. No Blizzard or StarCraft names, race or unit names, logos, fonts, sounds, UI art, or signature color schemes. No reference image is shipped, traced, or sampled.
+5. VISUAL DEFECTS TO AVOID (each one is a failure): a planet that reads as a smooth gradient ball; one uniform plastic specular across land, water, and ice; visible cube face seams or pole pinching; color banding in dark gradients; rainbow or oversaturated random palettes; square or hard-edged star points; a galaxy drawn as a flat 2D image or as uniform random scatter with no arm structure; an atmosphere drawn as a hard-edged flat ring; bloom haze that washes out the whole frame; full-screen lens flare streaks; texture popping instead of the progressive bake.
+6. UI PATTERNS TO AVOID: pill badges with a colored dot and matching outline; purple to blue gradient buttons; rounded 16 px SaaS card grids; emoji or icon-font glyphs used as decoration; blur glass on every panel; the Orbitron font; centered hero text; spinner overlays that block the scene.
+7. PERFORMANCE AND MEMORY: HIGH holds 60 fps at 1080p on a GTX 1660 class GPU; MEDIUM holds 30 fps on Intel Iris Xe class graphics. No frame spends more than 8 ms on baking. GPU memory returns to baseline after leaving a level. Reason: the strategy layer needs the remaining budget.
+8. STACK: three.js is the only runtime dependency; everything else is a devDependency. No UI framework. No logarithmic depth buffer unless a level cannot meet the 1e5 near to far ratio.
+9. WINDOWS: npm scripts run in PowerShell and cmd. No bash-only syntax; configure through config files rather than environment variables.
+10. SCOPE: Deliver what was asked, at the scope intended. Make routine judgment
+    calls yourself, and check in only when different readings of the request would
+    lead to materially different work. If the request seems mistaken or a better
+    approach exists, say so in a sentence and continue with the task as asked
+    rather than quietly narrowing, widening, or transforming it. Finish the whole
+    task, and stop short of actions that are clearly beyond what was asked.
+11. DELEGATION: Delegate to a subagent only for large tasks that are genuinely
+    independent and parallelizable, such as a wide multi-file investigation. Do
+    not delegate work you can finish yourself in a handful of tool calls, and do
+    not use subagents to verify or double-check your own work. If one subagent can
+    complete the task, use one rather than several.
+12. CONTINUATION: This run is unattended. A progress update is not the end
+    of the task. After you report progress, continue with the next step in
+    the same turn. End the turn only when the task is complete or blocked
+    on input only the user can provide, and say which of the two it is.
+13. EXPLORE: Before the first edit, explore broadly with tool calls. Search
+    the repository, read the files and configuration the task touches, and
+    list what depends on them. Start changing files once the context
+    supports one reading of the task.
+14. COMMENTS: none.
+    Write NO comments in any generated file: no inline comments, no block comments,
+    no docstrings, no doc-comments, no XML doc, no JSDoc, no TODO or FIXME markers,
+    no section banners, no commented-out code. Express intent through naming and
+    structure instead. Keep only machine-read directives (shebangs, pragmas, linter
+    suppressions, generated-file markers, license headers) where the toolchain
+    requires them. Do not add comments to code you did not change.
+15. GIT: Do not create commits and do not publish. No commit, no
+    commit --amend, no merge, no rebase, no cherry-pick, no push, no tag, no
+    branch deletion, no pull request, no release, and no other command that
+    writes to git history or to a remote. Read-only inspection is allowed:
+    status, diff, log, show, blame, branch listing. Leave every change in the
+    working tree for the user to review and commit. If a commit message is
+    wanted, print it as plain text and do not run it.
+16. ATTRIBUTION: Never name yourself or any AI system in an artifact. No
+    Co-Authored-By trailer, no generated-with line, no assistant, model,
+    Claude, or Anthropic reference in commit messages, changelog entries, code
+    comments, file headers, pull request bodies, documentation, or file
+    metadata. The user is the sole author of record.
+17. OUTPUT: Code and file edits only. No preamble, no plan narration, no
+    summary of what changed, no walkthrough of how the code works, no
+    restatement of the request, no next-step suggestions, and no offer to
+    continue. On agent targets apply the edits directly and close with at most
+    one line listing the files touched. On chat targets return the code block
+    and nothing around it. Write prose only when the user asks a question,
+    when a blocking ambiguity stops the work, or when an explanation is
+    explicitly requested.
+18. PUNCTUATION: No dash as a sentence connector, interrupter, or
+    parenthetical in any prose you write: formula text, generated documents
+    and copy, code comments and docstrings, commit message text, changelog
+    entries, and chat narration. Banned in that role: the em dash, the en
+    dash, the double hyphen "--", and a spaced single hyphen. Swapping one
+    banned glyph for another does not satisfy the rule. Recast instead:
+    split into two sentences, use a colon, or use parentheses. Hyphens stay
+    inside compound words (read-only, well-known). ASCII punctuation only
+    in prose: straight quotes, three-period ellipsis, hyphen-minus. Code is
+    exempt byte for byte: CLI flags (--amend), decrement operators, SQL and
+    Lua comment markers, YAML and frontmatter delimiters, markdown table
+    delimiter rows, diff separators, regex, and any token whose characters
+    affect execution, parsing, or copy-paste. Prose inside code (comments,
+    docstrings, commit message bodies) follows the ban; the marker itself
+    is syntax and stays.
+19. EXECUTION: Run in the background. Do not take focus, do not raise, move,
+    resize, or arrange any window, and do not open a new console, terminal,
+    browser tab, file manager, editor, or viewer. Assume the user is working
+    or playing on this machine, and treat a stolen foreground window as a
+    defect rather than a side effect. Launch child processes windowless with
+    output redirected to files: CREATE_NO_WINDOW or a hidden show flag on
+    Windows, Start-Process with a hidden window style and no new window in
+    PowerShell, a detached background start elsewhere. Disable auto-open
+    behavior at its source instead of closing the window afterwards, in the
+    dev server, the launch profile, the test reporter, and the build script
+    alike. Write no SetForegroundWindow, BringWindowToTop, always-on-top, or
+    focus call into code or tests. Run GUI work off the interactive desktop:
+    a headless or offscreen backend, a dedicated Windows desktop created for
+    the run and destroyed after it, or a VM or container. Drive the app
+    through its automation interface, never by moving the real mouse or
+    sending real keystrokes. Send no desktop notification, toast, message
+    box, or interactive prompt. Capture evidence to files (logs, exit codes,
+    offscreen screenshots) and report from those. If a check cannot run
+    without the screen, stop and say so rather than taking it. Leave display,
+    focus, and input settings as you found them.
+</constraints>
+
+<evaluation>
+AUTOMATED CHECKS (all must pass):
+- npm run build exits 0 and emits dist/index.html as the only file the page needs, under 4 MB.
+- npm test passes: determinism, order independence, distributions, physics math, route round trips, golden hashes, Math.random scan.
+- npm run test:render passes: zero network requests beyond the page itself and its data: or blob: URLs; zero console errors and zero unhandled rejections; no WebGL context loss; one screenshot per level and per planet type in artifacts/screenshots with a luminance standard deviation above a non-blank threshold; after 20 round trips, renderer.info.memory textures and geometries are within 2 of the baseline; the same seed loaded twice yields the same data hash.
+- The production dist/index.html carries the CSP meta tag with connect-src 'none'.
+- The Playwright config and the Vite config open no browser window.
+
+REVIEWER CHECKLIST (for the user, from the screenshots and a live session):
+PASS conditions (all must be true):
+- ICE, LAVA, and SCORCHED planets match the material read of REF-ICE, REF-LAVA, and REF-BURNING.
+- Every planet type is recognizable from its roster thumbnail alone.
+- Rotating any level shows real 3D depth, and the poles are reachable at L3.
+- Dives and zoom-outs are continuous camera motion with no cut and no flicker at the level boundary.
+- A deep link reopens the exact object, and the back button steps up one level.
+- HIGH meets the frame rate target on the target hardware.
+FAIL conditions (any one fails the run):
+- Any defect from constraint 5 or constraint 6 is visible.
+- Any GENERATED value differs between two loads of the same seed.
+- Any Phase 2 to Phase 6 feature is present.
+</evaluation>
+
+<output_format>
+- Project files in the working directory: package.json, vite.config.ts, tsconfig.json, playwright.config.ts, index.html, src/ (config, core for seed and routing, gen, render with levels and shaders, ui), tests/ (unit and render), .gitignore covering node_modules, dist, and artifacts.
+- Module boundary: src/gen imports nothing from three.js or the DOM. src/render reads descriptors and never draws random numbers except through a descriptor's seed.
+- GLSL lives in .glsl files imported as raw strings.
+- Build output: dist/index.html, one file.
+- Test evidence: artifacts/screenshots/*.png, artifacts/logs/*.log, artifacts/progress.md.
+- Code style: TypeScript strict, no any, zero comments per constraint 14.
+- Closing message: one line listing the top-level paths touched and whether the task is complete or blocked.
+</output_format>
+
+<changelog>
+1.0 (2026-09-27): initial Phase 1 formula covering seeded universe generation, planet and star rendering, and four-level travel.
+</changelog>
